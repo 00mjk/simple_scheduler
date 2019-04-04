@@ -2,8 +2,8 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.Comparator;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static java.time.LocalDateTime.now;
@@ -14,13 +14,15 @@ public class Scheduler {
 
     private ConcurrentSkipListSet<Job> queue = new ConcurrentSkipListSet<>(new JobComparator());
 
-    public Scheduler() {
-        ConcurrentLinkedQueue<Job> backlog = new ConcurrentLinkedQueue<>();
+    private Object sLock = new Object();
 
-        Thread scheduler = new Thread(new ScheduleBuilder(queue, backlog), "scheduler");
+    public Scheduler() {
+        LinkedBlockingDeque<Job> backlog = new LinkedBlockingDeque<>();
+
+        Thread scheduler = new Thread(new ScheduleBuilder(queue, backlog, sLock), "scheduler");
         scheduler.start();
         //если нужен четкий порядок, то делаем один воркер
-        for (int i = 1; i < 4; i++) {
+        for (int i = 1; i < 2; i++) {
             (new Thread(new Worker(backlog), "worker-" + i)).start();
         }
     }
@@ -28,6 +30,10 @@ public class Scheduler {
     public long schedule(LocalDateTime time, Callable callable) {
         Job job = new Job(id.incrementAndGet(), time, callable);
         queue.add(job);
+        //
+        synchronized (sLock) {
+            sLock.notify();
+        }
         return job.id;
     }
 
@@ -36,21 +42,28 @@ public class Scheduler {
 
         private ConcurrentSkipListSet<Job> queue;
 
-        private ConcurrentLinkedQueue<Job> backlog;
+        private LinkedBlockingDeque<Job> backlog;
 
-        public ScheduleBuilder(ConcurrentSkipListSet<Job> queue, ConcurrentLinkedQueue<Job> backlog) {
+        private Object lock;
+
+        public ScheduleBuilder(ConcurrentSkipListSet<Job> queue, LinkedBlockingDeque<Job> backlog, Object lock) {
             this.queue = queue;
             this.backlog = backlog;
+            this.lock = lock;
         }
 
         @Override
         public void run() {
-            for (;;) {
-                while(!queue.isEmpty() && queue.first().time < toMillis(now())) {
+            for (; ; ) {
+                long toWait = 0;
+                while (!queue.isEmpty() && (toWait = queue.first().time - toMillis(now())) <= 0) {
                     backlog.add(queue.pollFirst());
                 }
                 try {
-                    Thread.sleep(100);
+                    //очередь пуста
+                    synchronized (lock) {
+                        lock.wait(toWait > 0 ? toWait : 0);
+                    }
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
                 }
@@ -79,37 +92,34 @@ public class Scheduler {
         @Override
         public int compare(Job j1, Job j2) {
             if (j1.time < j2.time) return -1;
-            if (j1.time == j2.time) return j1.id < j2.id ? -1 : 1;
+            if (j1.time == j2.time) return Long.compare(j1.id, j2.id);
             return 1;
         }
     }
 
     private class Worker implements Runnable {
 
-        ConcurrentLinkedQueue<Job> backlog;
+        LinkedBlockingDeque<Job> backlog;
 
-        public Worker(ConcurrentLinkedQueue<Job> backlog) {
+        public Worker(LinkedBlockingDeque<Job> backlog) {
             this.backlog = backlog;
         }
 
         @Override
         public void run() {
-            for(;;) {
-                Job task = backlog.poll();
-                if (task == null) {
-                    try {
-                        Thread.sleep(100);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                } else {
-                    try {
-                        task.task.call();
-                    } catch (Exception e) {
-                        // TODO something
-                    }
+            for (; ; ) {
+                Job task;
+                try {
+                    //ждем пока в очереди что-то не появится
+                    task = backlog.takeFirst();
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
                 }
-
+                try {
+                    task.task.call();
+                } catch (Exception e) {
+                    // TODO something
+                }
             }
 
         }
